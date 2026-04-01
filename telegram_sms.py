@@ -42,6 +42,22 @@ WATCHED_CHATS_RAW  = get_env("WATCHED_CHATS", required=False)
 SMS_TEMPLATE       = os.environ.get("SMS_TEMPLATE", "{chat}: {message}")
 MAX_MSG_LENGTH     = int(os.environ.get("MAX_MSG_LENGTH", "120"))
 
+# ── Filter: SMS NUR bei diesen Keywords ──────────────────────────────────────────────────────────────
+TRIGGER_KEYWORDS = [
+    "$XAUUSD",
+    "#XAUUSD",
+]
+
+# ── Filter: Diese Texte NIEMALS per SMS senden ────────────────────────────────────────────────
+BLACKLIST_PHRASES = [
+    "Trading is not for everyone.",
+    "Lot Sizing Guidelines for Effective Money Management",
+    "VIP INVESTMENT PLANS",
+    "Good day Admin,  please I want to know more about your investment trading.",
+    "Nice, I would love to start with 5000 USDT",
+    "Success rarely comes from waiting—it comes from taking calculated risks.",
+]
+
 
 # ── Hilfsfunktionen ───────────────────────────────────────────────────────────────────────────────
 def parse_watched_chats(raw: str) -> list:
@@ -110,8 +126,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not should_notify(chat_id, chat_name, watched):
             return
 
-        text = message.text or message.caption or "[Kein Text / Medieninhalt]"
-        log.info(f"📩 Neue Nachricht – {sender} in [{chat_name}]")
+        text = message.text or message.caption or ""
+        if not text:
+            return
+
+        # Blacklist: bestimmte Standardtexte ignorieren
+        for phrase in BLACKLIST_PHRASES:
+            if phrase in text:
+                log.info(f"🚫 Nachricht gefiltert (Blacklist): [{chat_name}]")
+                return
+
+        # Whitelist: nur SMS wenn $XAUUSD oder #XAUUSD enthalten
+        if not any(kw in text for kw in TRIGGER_KEYWORDS):
+            log.info(f"⏭️ Nachricht übersprungen (kein Trigger): [{chat_name}]")
+            return
+
+        log.info(f"📩 Trigger erkannt – SMS wird gesendet [{chat_name}]")
         send_sms(sender=sender, chat=chat_name, message=text)
 
     except Exception as e:
