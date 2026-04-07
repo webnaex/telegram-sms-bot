@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-Telegram Bot → SMS Benachrichtigung (Railway-Version)
-Überwacht Telegram-Gruppen und sendet eine SMS bei neuen Nachrichten.
+Telegram Bot -> SMS Benachrichtigung (Railway-Version)
+Ueberwacht Telegram-Kanaele und sendet eine SMS bei neuen Nachrichten.
 
-Konfiguration über Umgebungsvariablen in Railway.
+Konfiguration ueber Umgebungsvariablen in Railway.
 """
 
 import os
 import sys
 import logging
+import hashlib
+import time
 import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# ── Logging ─────────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -22,7 +23,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Konfiguration aus Umgebungsvariablen ────────────────────────────────────────────
 def get_env(key: str, required: bool = True) -> str:
     val = os.environ.get(key, "").strip()
     if required and not val:
@@ -30,25 +30,25 @@ def get_env(key: str, required: bool = True) -> str:
         sys.exit(1)
     return val
 
-TELEGRAM_BOT_TOKEN = get_env("TELEGRAM_BOT_TOKEN")   # Von @BotFather
-
-SEVEN_API_KEY      = get_env("SEVEN_API_KEY")          # Von seven.io Dashboard
-SMS_FROM           = get_env("SMS_FROM")               # Absendername, z.B. "TelegramBot"
-SMS_TO             = get_env("SMS_TO")                 # Deine Handynummer, z.B. +4912345678
-
-# Kommagetrennte Chat-Namen oder IDs – leer = alle Gruppen/Chats
+TELEGRAM_BOT_TOKEN = get_env("TELEGRAM_BOT_TOKEN")
+SEVEN_API_KEY      = get_env("SEVEN_API_KEY")
+SMS_FROM           = get_env("SMS_FROM")
+SMS_TO             = get_env("SMS_TO")
 WATCHED_CHATS_RAW  = get_env("WATCHED_CHATS", required=False)
-
 SMS_TEMPLATE       = os.environ.get("SMS_TEMPLATE", "{chat}: {message}")
 MAX_MSG_LENGTH     = int(os.environ.get("MAX_MSG_LENGTH", "120"))
 
-# ── Filter: SMS NUR bei diesen Keywords ──────────────────────────────────────────────────────────────
+# Duplikat-Schutz: gleiche Nachricht max. 1x pro Stunde
+DEDUP_CACHE: dict = {}
+DEDUP_TTL = 3600
+
+# SMS NUR bei diesen Keywords
 TRIGGER_KEYWORDS = [
     "$XAUUSD",
     "#XAUUSD",
 ]
 
-# ── Filter: Diese Texte NIEMALS per SMS senden ────────────────────────────────────────────────
+# Diese Texte NIEMALS per SMS senden
 BLACKLIST_PHRASES = [
     "Trading is not for everyone.",
     "Lot Sizing Guidelines for Effective Money Management",
@@ -59,7 +59,6 @@ BLACKLIST_PHRASES = [
 ]
 
 
-# ── Hilfsfunktionen ───────────────────────────────────────────────────────────────────────────────
 def parse_watched_chats(raw: str) -> list:
     if not raw:
         return []
@@ -89,7 +88,7 @@ def should_notify(chat_id: int, chat_name: str, watched: list) -> bool:
 def send_sms(sender: str, chat: str, message: str):
     try:
         if len(message) > MAX_MSG_LENGTH:
-            message = message[:MAX_MSG_LENGTH] + "…"
+            message = message[:MAX_MSG_LENGTH] + "..."
 
         body = SMS_TEMPLATE.format(sender=sender, chat=chat, message=message)
 
@@ -100,25 +99,22 @@ def send_sms(sender: str, chat: str, message: str):
             timeout=10,
         )
         response.raise_for_status()
-        log.info(f"✅ SMS gesendet → {SMS_TO}")
+        log.info(f"SMS gesendet -> {SMS_TO}")
     except Exception as e:
         log.error(f"SMS-Fehler: {e}")
 
 
-# ── Bot-Handler ───────────────────────────────────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         message = update.message or update.channel_post
         if not message:
             return
 
-        # Absender
         sender = "Unbekannt"
         if message.from_user:
             u = message.from_user
             sender = " ".join(filter(None, [u.first_name, u.last_name])) or u.username or str(u.id)
 
-        # Chat
         chat_id   = message.chat.id
         chat_name = message.chat.title or message.chat.username or str(chat_id)
 
@@ -130,40 +126,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text:
             return
 
-        # Blacklist: bestimmte Standardtexte ignorieren
+        # Blacklist
         for phrase in BLACKLIST_PHRASES:
             if phrase in text:
-                log.info(f"🚫 Nachricht gefiltert (Blacklist): [{chat_name}]")
+                log.info(f"Nachricht gefiltert (Blacklist): [{chat_name}]")
                 return
 
-        # Whitelist: nur SMS wenn $XAUUSD oder #XAUUSD enthalten
+        # Whitelist: nur SMS wenn Trigger-Keyword enthalten
         if not any(kw in text for kw in TRIGGER_KEYWORDS):
-            log.info(f"⏭️ Nachricht übersprungen (kein Trigger): [{chat_name}]")
+            log.info(f"Nachricht uebersprungen (kein Trigger): [{chat_name}]")
             return
 
-        log.info(f"📩 Trigger erkannt – SMS wird gesendet [{chat_name}]")
+        # Duplikat-Check: gleicher Text innerhalb 1 Stunde -> nur 1 SMS
+        msg_hash = hashlib.md5(text.encode()).hexdigest()
+        now = time.time()
+        expired = [h for h, t in DEDUP_CACHE.items() if now - t > DEDUP_TTL]
+        for h in expired:
+            del DEDUP_CACHE[h]
+        if msg_hash in DEDUP_CACHE:
+            log.info(f"Duplikat ignoriert (bereits gesendet): [{chat_name}]")
+            return
+        DEDUP_CACHE[msg_hash] = now
+
+        log.info(f"Trigger erkannt - SMS wird gesendet [{chat_name}]")
         send_sms(sender=sender, chat=chat_name, message=text)
 
     except Exception as e:
         log.error(f"Fehler beim Verarbeiten: {e}")
 
 
-# ── Hauptprogramm ─────────────────────────────────────────────────────────────────────────────────
 def main():
     watched = parse_watched_chats(WATCHED_CHATS_RAW)
-    watch_info = ", ".join(str(w) for w in watched) if watched else "alle Chats & Gruppen"
-    log.info(f"🤖 Telegram Bot startet | Beobachte: {watch_info}")
-    log.info(f"📱 SMS-Ziel: {SMS_TO}")
+    watch_info = ", ".join(str(w) for w in watched) if watched else "alle Chats & Kanaele"
+    log.info(f"Telegram Bot startet | Beobachte: {watch_info}")
+    log.info(f"SMS-Ziel: {SMS_TO}")
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Nachrichten aus Gruppen, Channels und Direktnachrichten
     app.add_handler(MessageHandler(
         filters.ALL & ~filters.COMMAND,
         handle_message
     ))
 
-    log.info("🟢 Bot läuft. Warte auf Nachrichten…")
+    log.info("Bot laeuft. Warte auf Nachrichten...")
     app.run_polling(drop_pending_updates=True)
 
 
