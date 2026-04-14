@@ -44,10 +44,20 @@ WATCHED_CHATS_RAW  = get_env("WATCHED_CHATS", required=False)
 SMS_TEMPLATE       = os.environ.get("SMS_TEMPLATE", "{chat}: {message}")
 MAX_MSG_LENGTH     = int(os.environ.get("MAX_MSG_LENGTH", "120"))
 
-# ── Duplikat-Schutz: gleiche Nachricht max. 1x pro Stunde ────────────────────
-DEDUP_CACHE: dict = {}   # hash → timestamp
-DEDUP_TTL    = 3600      # exakt gleicher Text: 1 Stunde
-DEDUP_TTL_TP = 1800      # "$XAUUSD TP"-Gruppe: 30 Minuten
+# ── Duplikat-Schutz ───────────────────────────────────────────────────────────
+DEDUP_CACHE: dict = {}     # key → timestamp
+DEDUP_TTL        = 3600    # exakt gleicher Text: 1 Stunde
+DEDUP_TTL_RESULT = 14400   # Ergebnis-Gruppe: 4 Stunden (bis neues Signal)
+
+RESULT_GROUP_KEY = "XAUUSD_RESULT_GROUP"
+
+# Keywords die eine Ergebnis-Nachricht kennzeichnen (TP getroffen, Ziel erreicht)
+RESULT_KEYWORDS = [
+    "SMASHED",
+    "PIPS PROFIT",
+    "XAUUSD TP",
+    "XAUUSD TARGET",
+]
 
 # ── Filter: SMS NUR bei diesen Keywords ───────────────────────────────────────
 TRIGGER_KEYWORDS = [
@@ -150,15 +160,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Duplikat-Check
         now = time.time()
-        # Alle "$XAUUSD TP..." / "#XAUUSD TP..." teilen einen Gruppen-Key → 30 Min Cooldown
-        if "XAUUSD TP" in text:
-            dedup_key = "XAUUSD_TP_GROUP"
-            ttl = DEDUP_TTL_TP
+        is_result = any(kw in text for kw in RESULT_KEYWORDS)
+
+        if is_result:
+            # Alle Ergebnis-Nachrichten (TP, TARGET, SMASHED, PROFIT) → eine Gruppe
+            # Erst wenn ein neues Signal kommt, wird der Cooldown zurückgesetzt
+            dedup_key = RESULT_GROUP_KEY
+            ttl = DEDUP_TTL_RESULT
         else:
+            # Signal-Nachricht (SELL NOW, BUY NOW, etc.)
+            # → Ergebnis-Cooldown zurücksetzen, damit die nächsten Ergebnisse wieder 1x kommen
+            DEDUP_CACHE.pop(RESULT_GROUP_KEY, None)
             dedup_key = hashlib.md5(text.encode()).hexdigest()
             ttl = DEDUP_TTL
+
         # Abgelaufene Einträge aufräumen
-        expired = [h for h, t in DEDUP_CACHE.items() if now - t > DEDUP_TTL]
+        expired = [h for h, t in DEDUP_CACHE.items() if now - t > DEDUP_TTL_RESULT]
         for h in expired:
             del DEDUP_CACHE[h]
         if dedup_key in DEDUP_CACHE and now - DEDUP_CACHE[dedup_key] < ttl:
