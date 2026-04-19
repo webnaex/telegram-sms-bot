@@ -11,9 +11,11 @@ import sys
 import logging
 import hashlib
 import time
+import re
 import requests
+from datetime import datetime, timedelta
 from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -33,16 +35,25 @@ def get_env(key: str, required: bool = True) -> str:
     return val
 
 TELEGRAM_BOT_TOKEN = get_env("TELEGRAM_BOT_TOKEN")   # Von @BotFather
-
 SEVEN_API_KEY      = get_env("SEVEN_API_KEY")          # Von seven.io Dashboard
 SMS_FROM           = get_env("SMS_FROM")               # Absendername, z.B. "TelegramBot"
 SMS_TO             = get_env("SMS_TO")                 # Deine Handynummer, z.B. +4912345678
+
+# Deine eigene Telegram-User-ID (Zahlen-ID, nicht Username) – nur du kannst pausieren
+# Leer lassen = jeder kann den Bot steuern (nicht empfohlen!)
+ADMIN_USER_ID_RAW  = get_env("ADMIN_USER_ID", required=False)
+ADMIN_USER_ID      = int(ADMIN_USER_ID_RAW) if ADMIN_USER_ID_RAW else None
 
 # Kommagetrennte Chat-Namen oder IDs – leer = alle Gruppen/Chats
 WATCHED_CHATS_RAW  = get_env("WATCHED_CHATS", required=False)
 
 SMS_TEMPLATE       = os.environ.get("SMS_TEMPLATE", "{chat}: {message}")
 MAX_MSG_LENGTH     = int(os.environ.get("MAX_MSG_LENGTH", "120"))
+
+# ── Pause-Status ──────────────────────────────────────────────────────────────
+# 0 = nicht pausiert, float timestamp = pausiert bis zu diesem Zeitpunkt
+# -1 = dauerhaft pausiert (bis /resume)
+PAUSE_UNTIL: float = 0.0
 
 # ── Duplikat-Schutz ───────────────────────────────────────────────────────────
 DEDUP_CACHE: dict = {}     # key → timestamp
@@ -103,6 +114,101 @@ def should_notify(chat_id: int, chat_name: str, watched: list) -> bool:
     return False
 
 
+def is_admin(user_id: int) -> bool:
+    if ADMIN_USER_ID is None:
+        return True  # kein Admin gesetzt → alle erlaubt
+    return user_id == ADMIN_USER_ID
+
+
+def is_sms_paused() -> bool:
+    """Gibt True zurück wenn SMS-Versand gerade pausiert ist."""
+    global PAUSE_UNTIL
+    if PAUSE_UNTIL == 0.0:
+        return False
+    if PAUSE_UNTIL == -1.0:
+        return True  # dauerhaft pausiert
+    if time.time() < PAUSE_UNTIL:
+        return True
+    # Pause abgelaufen → automatisch zurücksetzen
+    PAUSE_UNTIL = 0.0
+    log.info("⏰ Pause abgelaufen – SMS-Versand wieder aktiv.")
+    return False
+
+
+def parse_pause_arg(arg: str) -> tuple[float, str]:
+    """
+    Parst das Argument für /pause und gibt (timestamp_until, beschreibung) zurück.
+    timestamp_until = -1 bedeutet dauerhaft.
+
+    Unterstützte Formate:
+      (leer)              → dauerhaft
+      30m                 → 30 Minuten
+      2h                  → 2 Stunden
+      3d                  → 3 Tage
+      23:00               → heute 23:00 Uhr (morgen falls schon vorbei)
+      24.04.2026 11:00    → exaktes Datum + Uhrzeit
+      24.04.2026          → exaktes Datum, 00:00 Uhr
+    """
+    arg = arg.strip()
+
+    if not arg:
+        return -1.0, "dauerhaft"
+
+    # Minuten: 30m
+    m = re.fullmatch(r"(\d+)m", arg, re.IGNORECASE)
+    if m:
+        secs = int(m.group(1)) * 60
+        until = time.time() + secs
+        desc = f"{m.group(1)} Minuten (bis {datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')})"
+        return until, desc
+
+    # Stunden: 2h
+    m = re.fullmatch(r"(\d+)h", arg, re.IGNORECASE)
+    if m:
+        secs = int(m.group(1)) * 3600
+        until = time.time() + secs
+        desc = f"{m.group(1)} Stunden (bis {datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')})"
+        return until, desc
+
+    # Tage: 3d
+    m = re.fullmatch(r"(\d+)d", arg, re.IGNORECASE)
+    if m:
+        secs = int(m.group(1)) * 86400
+        until = time.time() + secs
+        desc = f"{m.group(1)} Tage (bis {datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')})"
+        return until, desc
+
+    # Uhrzeit: 23:00
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", arg)
+    if m:
+        now = datetime.now()
+        target = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        until = target.timestamp()
+        desc = f"bis {target.strftime('%d.%m.%Y %H:%M')} Uhr"
+        return until, desc
+
+    # Datum + Uhrzeit: 24.04.2026 11:00
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})", arg)
+    if m:
+        target = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)),
+                          int(m.group(4)), int(m.group(5)))
+        until = target.timestamp()
+        desc = f"bis {target.strftime('%d.%m.%Y %H:%M')} Uhr"
+        return until, desc
+
+    # Nur Datum: 24.04.2026
+    m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", arg)
+    if m:
+        target = datetime(int(m.group(3)), int(m.group(2)), int(m.group(1)), 0, 0)
+        until = target.timestamp()
+        desc = f"bis {target.strftime('%d.%m.%Y')} 00:00 Uhr"
+        return until, desc
+
+    return None, None  # ungültiges Format
+
+
 def send_sms(sender: str, chat: str, message: str):
     try:
         if len(message) > MAX_MSG_LENGTH:
@@ -120,6 +226,63 @@ def send_sms(sender: str, chat: str, message: str):
         log.info(f"✅ SMS gesendet → {SMS_TO}")
     except Exception as e:
         log.error(f"SMS-Fehler: {e}")
+
+
+# ── Befehle ───────────────────────────────────────────────────────────────────
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global PAUSE_UNTIL
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("❌ Nicht autorisiert.")
+        return
+
+    arg = " ".join(context.args) if context.args else ""
+    until, desc = parse_pause_arg(arg)
+
+    if until is None:
+        await update.message.reply_text(
+            "❌ Ungültiges Format. Beispiele:\n"
+            "/pause → dauerhaft\n"
+            "/pause 30m → 30 Minuten\n"
+            "/pause 2h → 2 Stunden\n"
+            "/pause 3d → 3 Tage\n"
+            "/pause 23:00 → bis 23:00 Uhr\n"
+            "/pause 24.04.2026 11:00 → bis Datum & Uhrzeit"
+        )
+        return
+
+    PAUSE_UNTIL = until
+    log.info(f"⏸ SMS pausiert {desc} (von User {user.id})")
+    await update.message.reply_text(f"⏸ SMS-Versand pausiert {desc}.")
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global PAUSE_UNTIL
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("❌ Nicht autorisiert.")
+        return
+
+    PAUSE_UNTIL = 0.0
+    log.info(f"▶️ SMS wieder aktiviert (von User {user.id})")
+    await update.message.reply_text("▶️ SMS-Versand wieder aktiv.")
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("❌ Nicht autorisiert.")
+        return
+
+    if is_sms_paused():
+        if PAUSE_UNTIL == -1.0:
+            msg = "⏸ SMS-Versand ist dauerhaft pausiert.\n/resume zum Aktivieren."
+        else:
+            until_str = datetime.fromtimestamp(PAUSE_UNTIL).strftime("%d.%m.%Y %H:%M")
+            msg = f"⏸ SMS-Versand pausiert bis {until_str} Uhr.\n/resume zum sofortigen Aktivieren."
+    else:
+        msg = "✅ SMS-Versand ist aktiv."
+    await update.message.reply_text(msg)
 
 
 # ── Bot-Handler ───────────────────────────────────────────────────────────────
@@ -155,7 +318,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Whitelist: nur SMS wenn $XAUUSD oder #XAUUSD enthalten
         if not any(kw in text for kw in TRIGGER_KEYWORDS):
-            log.info(f"⏭️ Nachricht øbersprungen (kein Trigger): [{chat_name}]")
+            log.info(f"⏭️ Nachricht übersprungen (kein Trigger): [{chat_name}]")
+            return
+
+        # Pause-Check
+        if is_sms_paused():
+            if PAUSE_UNTIL == -1.0:
+                log.info(f"⏸ SMS pausiert (dauerhaft) – übersprungen: [{chat_name}]")
+            else:
+                until_str = datetime.fromtimestamp(PAUSE_UNTIL).strftime("%d.%m.%Y %H:%M")
+                log.info(f"⏸ SMS pausiert bis {until_str} – übersprungen: [{chat_name}]")
             return
 
         # Duplikat-Check
@@ -163,13 +335,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_result = any(kw in text for kw in RESULT_KEYWORDS)
 
         if is_result:
-            # Alle Ergebnis-Nachrichten (TP, TARGET, SMASHED, PROFIT) → eine Gruppe
-            # Erst wenn ein neues Signal kommt, wird der Cooldown zurückgesetzt
             dedup_key = RESULT_GROUP_KEY
             ttl = DEDUP_TTL_RESULT
         else:
-            # Signal-Nachricht (SELL NOW, BUY NOW, etc.)
-            # → Ergebnis-Cooldown zurücksetzen, damit die nächsten Ergebnisse wieder 1x kommen
+            # Signal → Ergebnis-Cooldown zurücksetzen
             DEDUP_CACHE.pop(RESULT_GROUP_KEY, None)
             dedup_key = hashlib.md5(text.encode()).hexdigest()
             ttl = DEDUP_TTL
@@ -198,6 +367,11 @@ def main():
     log.info(f"📱 SMS-Ziel: {SMS_TO}")
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    # Steuerungsbefehle (nur per Direktnachricht an den Bot)
+    app.add_handler(CommandHandler("pause",  cmd_pause))
+    app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("status", cmd_status))
 
     # Nachrichten aus Gruppen, Channels und Direktnachrichten
     app.add_handler(MessageHandler(
