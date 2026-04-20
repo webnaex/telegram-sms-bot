@@ -3,7 +3,7 @@
 Telegram Bot → SMS Benachrichtigung (Railway-Version)
 Überwacht Telegram-Gruppen und sendet eine SMS bei neuen Nachrichten.
 
-Konfiguration über Umgebungsvariablen in Railway.
+Konfiguration øber Umgebungsvariablen in Railway.
 """
 
 import os
@@ -285,6 +285,27 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("❌ Nicht autorisiert.")
+        return
+
+    msg = (
+        "📋 *Verfügbare Befehle:*\n\n"
+        "/status — Aktuellen SMS-Status anzeigen\n\n"
+        "/pause — SMS dauerhaft pausieren\n"
+        "/pause 30m — Für 30 Minuten pausieren\n"
+        "/pause 2h — Für 2 Stunden pausieren\n"
+        "/pause 3d — Für 3 Tage pausieren\n"
+        "/pause 23:00 — Bis heute 23:00 Uhr pausieren\n"
+        "/pause 24.04.2026 11:00 — Bis Datum & Uhrzeit pausieren\n\n"
+        "/resume — SMS-Versand sofort wieder aktivieren\n\n"
+        "/help — Diese Hilfe anzeigen"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
 # ── Bot-Handler ───────────────────────────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -324,10 +345,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Pause-Check
         if is_sms_paused():
             if PAUSE_UNTIL == -1.0:
-                log.info(f"⏸ SMS pausiert (dauerhaft) – übersprungen: [{chat_name}]")
+                log.info(f"⏸ SMS pausiert (dauerhaft) – øbersprungen: [{chat_name}]")
             else:
                 until_str = datetime.fromtimestamp(PAUSE_UNTIL).strftime("%d.%m.%Y %H:%M")
-                log.info(f"⏸ SMS pausiert bis {until_str} – übersprungen: [{chat_name}]")
+                log.info(f"⏸ SMS pausiert bis {until_str} – øbersprungen: [{chat_name}]")
             return
 
         # Duplikat-Check
@@ -372,6 +393,7 @@ def main():
     app.add_handler(CommandHandler("pause",  cmd_pause))
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("help",   cmd_help))
 
     # Nachrichten aus Gruppen, Channels und Direktnachrichten
     app.add_handler(MessageHandler(
